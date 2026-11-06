@@ -455,6 +455,18 @@ def _merge_album_glossary(jobs, track_guides):
                 seen_wrong.add(w)
                 _add_term(c, m, f'原误识:{w}')
 
+    # Find primary anchor track (prefer 1.wav / 01.wav or lowest index) to broadcast album-wide world view & scene constraints
+    sorted_guides = sorted(track_guides.items(), key=lambda x: x[0])
+    primary_stem = sorted_guides[0][0]
+    for s, _ in sorted_guides:
+        if re.search(r'(?:^|[\D])0?1(?:\.|\b)', s):
+            primary_stem = s
+            break
+    primary_guide = track_guides[primary_stem]
+    album_core_summary = primary_guide.get('story_summary_zh', '')
+    album_core_scene = primary_guide.get('scene_constraints_zh', '')
+    album_core_tone = primary_guide.get('character_tone_zh', '')
+
     for stem, tg in sorted(track_guides.items(), key=lambda x: x[0]):
         for k_field in ('story_summary_zh', 'scene_constraints_zh', 'character_self_reference_ja'):
             val = tg.get(k_field, '')
@@ -469,6 +481,10 @@ def _merge_album_glossary(jobs, track_guides):
         tg['album_shared_terms'] = shared_terms[:30]
         tg['album_shared_fixes'] = shared_fixes[:20]
         tg['album_self_references'] = ', '.join(self_refs)
+        # Deep heritage from 01.wav: ensure all tracks inherit album world view and emotional baseline
+        tg['album_core_summary'] = album_core_summary
+        tg['album_core_scene'] = album_core_scene
+        tg['album_core_tone'] = album_core_tone
     return shared_terms[:30], ', '.join(self_refs)
 
 
@@ -492,7 +508,14 @@ def _arbitrate_one_track(stem, out_dir, meta, track_guide, port):
     arb_sys = (
         'あなたは日本語の音声作品（ボイスドラマ・ASMR）の音声認識（ASR）校正のスペシャリストです。\n'
         f"【作品設定】{meta.get('synopsis_ja', '')}\n"
-        f"【本トラックあらすじ】{track_guide['story_summary_zh']}\n"
+        + (
+            f"【全作全局背景与核心设定（继承自开篇轨）】\n"
+            f"- 全剧核心脉络：{track_guide.get('album_core_summary', '')}\n"
+            f"- 全局人物身份与处境约束：{track_guide.get('album_core_scene', '')}\n"
+            f"- 角色基调与情感约束：{track_guide.get('album_core_tone', '')}\n"
+            if track_guide.get('album_core_summary') else ''
+        )
+        + f"【本トラックあらすじ】{track_guide['story_summary_zh']}\n"
         f"【シーン・設定と行動領域】{track_guide['scene_constraints_zh']}\n"
         f"【話し方・敬語と本音の切り替え】{track_guide.get('character_tone_zh', '')}\n"
         f'【キャラクター自称・一人称】{self_refs}\n'
@@ -502,8 +525,10 @@ def _arbitrate_one_track(stem, out_dir, meta, track_guide, port):
         '- 【A_anime (Anime-Whisper)】：声優の発音（仮名読み）や吐息・小声の聞き取りは非常に正確だが、漢字変換で同音異義語ミスを起こしやすい。\n'
         '- 【B_turbo (Whisper-Turbo)】：数字・小数・標準的な熟語に強いが、無言区間で『ご視聴ありがとうございました』等の幻覚を出すことがある。\n\n'
         '【厳守すべき校正ルール】\n'
-        '1. **シーン文脈と補正リストに基づく同音異義語の修正**：\n'
-        '   - 入力に `hints`（AB差異）がある場合、および上記の【誤変換補正リスト】に該当する語がある場合、`check` 欄で作品設定および前後の文脈と照合し、意味が通る正しい漢字・カタカナ表記を `ja_golden` に採用してください。\n'
+        '1. **全作背景・シーン文脈に基づく同音異義語の積極的修正**：\n'
+        '   - ASRは一般的な日常語や無関係な漢字（例：招集/召集、痴候、周期、火の中）に誤変換することが多々あります。必ず【全作全局背景】および本トラックのシーン設定（誰が・どのような状況で・何を行っているか）と照合してください。\n'
+        '   - 登場人物の境遇や行為に不自然な語がある場合、発音が同一または類似する適切な漢字（例：消臭、恥垢、臭気、胃の中など）へ是正してください。\n'
+        '   - 入力に `hints`（AB差異）がある場合、および上記の【誤変換補正リスト】に該当する語がある場合は、作品設定と前後の文脈に合致する表記を `ja_golden` に採用してください。\n'
         '   - AとBのどちらも同音異義語の誤変換を起こしている場合でも、前後の文脈から正しい同音語に補正してください。\n'
         '2. **話者交代・敬語と内心の声の句点（。/！/？）分離**：\n'
         '   - 1つの区間内で複数のキャラクターが掛け合いをしている場合、または表向きの敬語と内心の独白・小声のツッコミが切り替わる場合は、読点『、』で繋げず、必ず文末句点『**。**』『**！**』『**？**』で文を区切ってください。\n'
@@ -849,8 +874,18 @@ def _anchor_cues_one_track(stem, out_dir, meta, port):
     self_refs = track_guide.get('album_self_references') or track_guide.get('character_self_reference_ja', '')
     has_stereo = any(r.get('pos') in ('左声道', '右声道') for r in cues_in)
 
+    album_bg = ''
+    if track_guide.get('album_core_summary'):
+        album_bg = (
+            f"【全作全局背景与核心设定（继承自开篇轨）】\n"
+            f"- 全剧核心脉络：{track_guide.get('album_core_summary')}\n"
+            f"- 全局人物身份与处境约束：{track_guide.get('album_core_scene')}\n"
+            f"- 角色基调与情感约束：{track_guide.get('album_core_tone')}\n"
+        )
+
     anchor_sys = (
         '你是一位精通日语语法与声优台本的资深翻译专家。请将已切分好的日文字幕分句（aligned cues）逐条1对1直译为准确、忠实的简体中文语义锚点（zh_anchor）。\n'
+        + album_bg +
         f"【全轨剧情】{track_guide['story_summary_zh']}\n"
         f"【场景身份与核心动作】{track_guide['scene_constraints_zh']}\n"
         f"【角色语气与敬语反差】{track_guide.get('character_tone_zh', '')}（自称：{self_refs}）\n"
@@ -1016,9 +1051,19 @@ def _translate_one_track(stem, out_dir, meta, port):
         if ctx_after:
             ctx_str += '【后文只读上下文（切勿输出到结果中）】\n' + '\n'.join(ctx_after) + '\n\n'
 
+        album_bg = ''
+        if track_guide.get('album_core_summary'):
+            album_bg = (
+                f"【全作全局背景与核心设定（继承自开篇轨）】\n"
+                f"- 全剧核心脉络：{track_guide.get('album_core_summary')}\n"
+                f"- 全局人物身份与处境约束：{track_guide.get('album_core_scene')}\n"
+                f"- 角色基调与情感约束：{track_guide.get('album_core_tone')}\n\n"
+            )
+
         prompt = (
             '将以下日语音声逐字稿润色翻译成自然、准确、忠实的简体中文。\n\n'
             f'音轨：{track_label}\n'
+            + album_bg +
             f"全轨剧情脉络：{track_guide['story_summary_zh']}\n"
             f"场景与行动约束：{track_guide['scene_constraints_zh']}\n"
             f"角色语气与敬语反差：{track_guide['character_tone_zh']}（自称：{track_guide.get('album_self_references') or track_guide.get('character_self_reference_ja', '')}）\n\n"
