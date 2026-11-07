@@ -25,16 +25,21 @@ ROOT = Path('/content/japanese-subtitles')
 STAGES = ['dual-asr', 'arbitrate-ja', 'align', 'translate-zh']
 
 
-def _detect_gpu_parallel_config():
-    """Dynamically scale concurrency and context window based on available GPU VRAM (A100/H100 vs L4)."""
+def _detect_gpu_parallel_config(safety_reserve_mib=2560, slot_ctx=5120):
+    """Dynamically compute per-model concurrency and context size from exact measured VRAM footprints, keeping 2.5GB safety reserve."""
     try:
         import torch
         if torch.cuda.is_available():
-            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-            if vram_gb >= 35.0:  # A100 (40GB/80GB) or H100 (80GB)
-                return 24, 32, 131072, 163840
-            if vram_gb >= 20.0:  # L4 (24GB)
-                return 12, 24, 65536, 131072
+            total_mib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+            usable_mib = max(8192.0, total_mib - safety_reserve_mib)
+            # Measured on A100/L4:
+            # - Qwen3-14B-Q4_K_M: 9185 MiB base (weights+compute) + 152 MiB per 1024 ctx tokens (760 MiB per 5120-token slot)
+            # - ASMR-Qwen3.5-9B-Echo-Q6_K: 7700 MiB base (weights+compute) + 32.5 MiB per 1024 ctx tokens (162.5 MiB per 5120-token slot)
+            slot_kv_14b = 152.0 * (slot_ctx / 1024.0)
+            slot_kv_9b = 32.5 * (slot_ctx / 1024.0)
+            slots_14b = max(6, min(36, int((usable_mib - 9185.0) // slot_kv_14b)))
+            slots_9b = max(8, min(48, int((usable_mib - 7700.0) // slot_kv_9b)))
+            return slots_14b, slots_9b, slots_14b * slot_ctx, slots_9b * slot_ctx
     except Exception:
         pass
     return 6, 8, 40960, 40960
