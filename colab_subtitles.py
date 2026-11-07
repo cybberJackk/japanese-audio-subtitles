@@ -399,7 +399,7 @@ def main():
     p.add_argument('--zh-only', action='store_true', help='Save only Chinese sidecars (skip .ja.vtt/.ja.txt)')
     p.add_argument('--keep-drive-files', action='store_true', help='Do not delete cloud audio/job folders after local verification')
     p.add_argument('--dry-run', action='store_true', help='Scan folders and preview pending tracks without uploading or starting GPU')
-    p.add_argument('--gpu', default='L4', help='Colab GPU type (default: L4)')
+    p.add_argument('--gpu', default='', help='Colab GPU type (required: A100 or L4, e.g. --gpu A100)')
     p.add_argument('--session', default='', help='Optional custom Colab session name')
     p.add_argument('--keep-alive', action='store_true', help='Keep Colab session alive on exit (debugging only)')
     p.add_argument('--poll-seconds', type=float, default=5.0)
@@ -417,6 +417,19 @@ def main():
 
     if not args.targets:
         p.error('Specify at least one local audio folder or audio file')
+
+    # Mandatory manual GPU selection
+    valid_gpus = {'A100': 'A100', 'L4': 'L4'}
+    chosen_gpu = (args.gpu or '').strip().upper()
+    if not chosen_gpu or chosen_gpu not in valid_gpus:
+        print('\n' + '=' * 60, file=sys.stderr)
+        print('【错误：未指定或输入了无效的 GPU 类型参数】', file=sys.stderr)
+        print('为了确保显存和吞吐达到最优压榨参数（避免浪费算力），请显式指定 GPU 类型：', file=sys.stderr)
+        print('  --gpu A100   : 使用 A100-SXM4-40GB 极限参数 (41并发14B + 2x24双实例9B + bs192双流ASR)', file=sys.stderr)
+        print('  --gpu L4     : 使用 L4-24GB 极限参数 (16并发14B + 48并发单实例9B + bs96双流ASR)', file=sys.stderr)
+        print('=' * 60 + '\n', file=sys.stderr)
+        p.error('Missing or invalid --gpu parameter. Please rerun with --gpu A100 or --gpu L4.')
+    args.gpu = valid_gpus[chosen_gpu]
 
     discovered = discover_audio_files(args.targets, recursive=not args.no_recursive)
     if not discovered:
