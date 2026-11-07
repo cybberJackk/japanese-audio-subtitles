@@ -39,6 +39,8 @@ def _detect_gpu_parallel_config():
 
 
 DEFAULT_PARALLEL = _detect_gpu_parallel_config()
+DEFAULT_CTX_14B = 98304 if DEFAULT_PARALLEL >= 16 else 40960
+DEFAULT_CTX_9B = 98304 if DEFAULT_PARALLEL >= 16 else 32768
 
 DEFAULT_METADATA = {
     'work_title': '',
@@ -670,7 +672,7 @@ def run_arbitrate_batch(jobs, port=8090):
     if not jobs:
         return
     paths = json.loads((ROOT / 'models.json').read_text(encoding='utf-8'))
-    srv = start_llama_server(paths['qwen3-14b'], Path(jobs[0]['out_dir']), port, n_parallel=DEFAULT_PARALLEL, ctx_size=40960, log_name='qwen3-14b.log')
+    srv = start_llama_server(paths['qwen3-14b'], Path(jobs[0]['out_dir']), port, n_parallel=DEFAULT_PARALLEL, ctx_size=DEFAULT_CTX_14B, log_name='qwen3-14b.log')
     try:
         # Phase 1: Extract Track Guide for every track in the batch concurrently
         def _run_p1(job):
@@ -1154,7 +1156,7 @@ def run_translate_batch(jobs, port=8095):
         return
     paths = json.loads((ROOT / 'models.json').read_text(encoding='utf-8'))
     # Step 4a: Generate 1-to-1 cue-level semantic Chinese anchors (zh_anchor) with Qwen3-14B
-    srv_14b = start_llama_server(paths['qwen3-14b'], Path(jobs[0]['out_dir']), port, n_parallel=DEFAULT_PARALLEL, ctx_size=40960, log_name='qwen3-14b-anchor.log')
+    srv_14b = start_llama_server(paths['qwen3-14b'], Path(jobs[0]['out_dir']), port, n_parallel=DEFAULT_PARALLEL, ctx_size=DEFAULT_CTX_14B, log_name='qwen3-14b-anchor.log')
     try:
         for job in jobs:
             _anchor_cues_one_track(job['stem'], Path(job['out_dir']), job['meta'], port)
@@ -1162,7 +1164,7 @@ def run_translate_batch(jobs, port=8095):
         stop_server(srv_14b)
 
     # Step 4b: Polish cue-level translations with ASMR-Qwen3.5-9B-Echo anchored by zh_anchor
-    srv_9b = start_llama_server(paths['asmr-qwen35-9b-echo'], Path(jobs[0]['out_dir']), port, n_parallel=DEFAULT_PARALLEL, ctx_size=32768, log_name='asmr-9b.log')
+    srv_9b = start_llama_server(paths['asmr-qwen35-9b-echo'], Path(jobs[0]['out_dir']), port, n_parallel=DEFAULT_PARALLEL, ctx_size=DEFAULT_CTX_9B, log_name='asmr-9b.log')
     try:
         for job in jobs:
             out_dir = Path(job['out_dir'])
