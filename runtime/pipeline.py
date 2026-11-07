@@ -13,6 +13,7 @@ import argparse, json, os, re, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import atexit
 from subtitle_utils import (
     analyze_asr_pair, atomic_write_json, atomic_write_text, cap_guide_lines,
      compress_extreme_repeats, compute_span_pan, dedup_boundary_echo,
@@ -20,12 +21,21 @@ from subtitle_utils import (
     parse_arbitration, parse_translation, project_punctuation,
     read_nonempty_json, validate_cues, validate_vtt, write_vtt,
 )
+try:
+    from telemetry import ResourceProfiler
+except ImportError:
+    from runtime.telemetry import ResourceProfiler
+
+GLOBAL_PROFILER = ResourceProfiler()
+GLOBAL_PROFILER.start()
+
+DEFAULT_SLOT_CTX = 5120
 
 ROOT = Path('/content/japanese-subtitles')
 STAGES = ['dual-asr', 'arbitrate-ja', 'align', 'translate-zh']
 
 
-def _detect_gpu_parallel_config(safety_reserve_mib=2560, slot_ctx=5120):
+def _detect_gpu_parallel_config(safety_reserve_mib=2560, slot_ctx=DEFAULT_SLOT_CTX):
     """Dynamically compute per-model concurrency and context size from exact measured VRAM footprints, keeping 2.5GB safety reserve."""
     try:
         import torch
@@ -45,7 +55,26 @@ def _detect_gpu_parallel_config(safety_reserve_mib=2560, slot_ctx=5120):
     return 6, 8, 40960, 40960
 
 
-DEFAULT_PARALLEL, DEFAULT_PARALLEL_9B, DEFAULT_CTX_14B, DEFAULT_CTX_9B = _detect_gpu_parallel_config()
+DEFAULT_PARALLEL, DEFAULT_PARALLEL_9B, DEFAULT_CTX_14B, DEFAULT_CTX_9B = _detect_gpu_parallel_config(slot_ctx=DEFAULT_SLOT_CTX)
+
+
+def _on_pipeline_exit():
+    try:
+        GLOBAL_PROFILER.stop()
+        summary = GLOBAL_PROFILER.get_summary(configured_slots=DEFAULT_PARALLEL, configured_slot_ctx=DEFAULT_SLOT_CTX)
+        if summary['token_profile']['total_requests'] > 0 or summary['hardware']['peak_vram_mib'] > 0:
+            rep_txt = GLOBAL_PROFILER.format_report_text(summary)
+            print('\n' + rep_txt + '\n', flush=True)
+            try:
+                out_dest = ROOT / 'telemetry' / f'gpu_telemetry_pid_{os.getpid()}.json'
+                GLOBAL_PROFILER.write_report(out_dest, configured_slots=DEFAULT_PARALLEL, configured_slot_ctx=DEFAULT_SLOT_CTX)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+atexit.register(_on_pipeline_exit)
 
 DEFAULT_METADATA = {
     'work_title': '',
@@ -399,6 +428,7 @@ def _extract_track_guide(stem, out_dir, meta, port):
     last_err = None
     for temp_try in (0.15, 0.35, 0.55):
         try:
+            req_t0 = time.monotonic()
             r_p1 = requests.post(
                 f'http://127.0.0.1:{port}/v1/chat/completions',
                 json={
@@ -412,7 +442,10 @@ def _extract_track_guide(stem, out_dir, meta, port):
                 },
                 timeout=180,
             )
+            req_sec = time.monotonic() - req_t0
             r_p1.raise_for_status()
+            u_p1 = r_p1.json().get('usage') or {}
+            GLOBAL_PROFILER.record_request('track-guide', u_p1.get('prompt_tokens', 0), u_p1.get('completion_tokens', 0), req_sec)
             if r_p1.json()['choices'][0].get('finish_reason') == 'length':
                 raise ValueError('Track guide generation truncated')
             c_p1 = r_p1.json()['choices'][0]['message']['content'].strip()
@@ -618,6 +651,7 @@ def _arbitrate_one_track(stem, out_dir, meta, track_guide, port):
         last_err = None
         for temp_try in (0.1, 0.3, 0.5):
             try:
+                req_t0 = time.monotonic()
                 resp = requests.post(
                     f'http://127.0.0.1:{port}/v1/chat/completions',
                     json={
@@ -634,7 +668,10 @@ def _arbitrate_one_track(stem, out_dir, meta, track_guide, port):
                     },
                     timeout=180,
                 )
+                req_sec = time.monotonic() - req_t0
                 resp.raise_for_status()
+                u = resp.json().get('usage') or {}
+                GLOBAL_PROFILER.record_request('arbitrate-ja', u.get('prompt_tokens', 0), u.get('completion_tokens', 0), req_sec)
                 if resp.json()['choices'][0].get('finish_reason') == 'length':
                     raise ValueError('Arbitration generation truncated')
                 txt = resp.json()['choices'][0]['message']['content'].strip()
@@ -986,6 +1023,7 @@ def _anchor_cues_one_track(stem, out_dir, meta, port):
         last_err = None
         for temp_try in (0.1, 0.25, 0.4):
             try:
+                req_t0 = time.monotonic()
                 resp = requests.post(
                     f'http://127.0.0.1:{port}/v1/chat/completions',
                     json={
@@ -1002,7 +1040,10 @@ def _anchor_cues_one_track(stem, out_dir, meta, port):
                     },
                     timeout=180,
                 )
+                req_sec = time.monotonic() - req_t0
                 resp.raise_for_status()
+                u_anc = resp.json().get('usage') or {}
+                GLOBAL_PROFILER.record_request('anchor-14b', u_anc.get('prompt_tokens', 0), u_anc.get('completion_tokens', 0), req_sec)
                 if resp.json()['choices'][0].get('finish_reason') == 'length':
                     raise ValueError('Anchor generation truncated')
                 txt = resp.json()['choices'][0]['message']['content'].strip()
@@ -1121,8 +1162,12 @@ def _translate_one_track(stem, out_dir, meta, port):
                     'repeat_penalty': 1.12,
                     'chat_template_kwargs': {'enable_thinking': False},
                 }
+                req_t0 = time.monotonic()
                 resp = requests.post(f'http://127.0.0.1:{port}/v1/chat/completions', json=payload, timeout=180)
+                req_sec = time.monotonic() - req_t0
                 resp.raise_for_status()
+                u_tr = resp.json().get('usage') or {}
+                GLOBAL_PROFILER.record_request('translate-zh', u_tr.get('prompt_tokens', 0), u_tr.get('completion_tokens', 0), req_sec)
                 if resp.json()['choices'][0].get('finish_reason') == 'length':
                     raise ValueError('Translation generation truncated')
                 content = resp.json()['choices'][0]['message']['content'].strip()

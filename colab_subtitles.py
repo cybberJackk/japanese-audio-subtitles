@@ -28,6 +28,7 @@ RUNTIME_FILES = [
     'bootstrap.py',
     'pipeline.py',
     'worker.py',
+    'telemetry.py',
 ]
 
 
