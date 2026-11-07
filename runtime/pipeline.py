@@ -535,7 +535,7 @@ def _arbitrate_one_track(stem, out_dir, meta, track_guide, port):
         '3. **ja_golden（最終日本語テキスト）**：同音異義語・固有名詞・句読点を修正した自然な日本語文を出力してください。過度に連続反復する同一の擬音は自然な長さ（2〜3回＋…程度）に整えてください。'
     )
 
-    batch_sz = 6
+    batch_sz = 10
     batches = [(k, paired[k:k + batch_sz]) for k in range(0, len(paired), batch_sz)]
 
     def _arb_sub_batch(b_idx, sub):
@@ -637,7 +637,7 @@ def _arbitrate_one_track(stem, out_dir, meta, track_guide, port):
         return b_idx, arr
 
     golden_map = {}
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         for _, arr in ex.map(run_arb_batch, batches):
             for obj in arr:
                 cleaned_ja = normalize_ja_names(obj['ja_golden'].strip(), shared_terms, fixes=shared_fixes)
@@ -654,13 +654,13 @@ def run_arbitrate_batch(jobs, port=8090):
     if not jobs:
         return
     paths = json.loads((ROOT / 'models.json').read_text(encoding='utf-8'))
-    srv = start_llama_server(paths['qwen3-14b'], Path(jobs[0]['out_dir']), port, n_parallel=4, ctx_size=40960, log_name='qwen3-14b.log')
+    srv = start_llama_server(paths['qwen3-14b'], Path(jobs[0]['out_dir']), port, n_parallel=6, ctx_size=40960, log_name='qwen3-14b.log')
     try:
         # Phase 1: Extract Track Guide for every track in the batch concurrently
         def _run_p1(job):
             return job['stem'], _extract_track_guide(job['stem'], Path(job['out_dir']), job['meta'], port)
 
-        with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as ex:
+        with ThreadPoolExecutor(max_workers=min(6, len(jobs))) as ex:
             track_guides = dict(ex.map(_run_p1, jobs))
 
         # Broadcast album-wide character names, self-references, and glossary across all tracks
@@ -902,7 +902,7 @@ def _anchor_cues_one_track(stem, out_dir, meta, port):
         '4. **结合场景消歧多义词与俗语**：请严格参考上方的【统一术语表】与【本轨场景同音/多义词消歧约束】，确保多义词、行业俗语和专有术语符合当前场景，不产生字面误译或偏离原意的改写。'
     )
 
-    batch_sz = 10
+    batch_sz = 12
     batches = [(k, cues_in[k:k + batch_sz]) for k in range(0, len(cues_in), batch_sz)]
 
     def _fmt_ctx_line(idx_1based, r):
@@ -993,7 +993,7 @@ def _anchor_cues_one_track(stem, out_dir, meta, port):
         return [{'id': b_idx + 1, 'zh_anchor': sub[0]['ja']}]
 
     t0 = time.monotonic()
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         for _, arr in ex.map(lambda it: (it[0], _anchor_sub_batch(it[0], it[1])), batches):
             for obj in arr:
                 cues_in[obj['id'] - 1]['zh_anchor'] = obj['zh_anchor'].strip()
@@ -1019,7 +1019,7 @@ def _translate_one_track(stem, out_dir, meta, port):
 
     cues_in = json.loads((out_dir / 'aligned_cues.json').read_text(encoding='utf-8'))
     has_stereo = any(r.get('pos') in ('左声道', '右声道') for r in cues_in)
-    batch_sz = 10
+    batch_sz = 12
     batches = [(k, cues_in[k:k + batch_sz]) for k in range(0, len(cues_in), batch_sz)]
 
     def _translate_sub_batch(b_idx, sub):
@@ -1121,7 +1121,7 @@ def _translate_one_track(stem, out_dir, meta, port):
         return b_idx, _translate_sub_batch(b_idx, sub)
 
     t0 = time.monotonic()
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         res = sorted(ex.map(proc_batch, batches), key=lambda x: x[0])
     elapsed = round(time.monotonic() - t0, 2)
 
@@ -1138,7 +1138,7 @@ def run_translate_batch(jobs, port=8095):
         return
     paths = json.loads((ROOT / 'models.json').read_text(encoding='utf-8'))
     # Step 4a: Generate 1-to-1 cue-level semantic Chinese anchors (zh_anchor) with Qwen3-14B
-    srv_14b = start_llama_server(paths['qwen3-14b'], Path(jobs[0]['out_dir']), port, n_parallel=4, ctx_size=40960, log_name='qwen3-14b-anchor.log')
+    srv_14b = start_llama_server(paths['qwen3-14b'], Path(jobs[0]['out_dir']), port, n_parallel=6, ctx_size=40960, log_name='qwen3-14b-anchor.log')
     try:
         for job in jobs:
             _anchor_cues_one_track(job['stem'], Path(job['out_dir']), job['meta'], port)
@@ -1146,7 +1146,7 @@ def run_translate_batch(jobs, port=8095):
         stop_server(srv_14b)
 
     # Step 4b: Polish cue-level translations with ASMR-Qwen3.5-9B-Echo anchored by zh_anchor
-    srv_9b = start_llama_server(paths['asmr-qwen35-9b-echo'], Path(jobs[0]['out_dir']), port, n_parallel=4, ctx_size=32768, log_name='asmr-9b.log')
+    srv_9b = start_llama_server(paths['asmr-qwen35-9b-echo'], Path(jobs[0]['out_dir']), port, n_parallel=6, ctx_size=32768, log_name='asmr-9b.log')
     try:
         for job in jobs:
             out_dir = Path(job['out_dir'])
