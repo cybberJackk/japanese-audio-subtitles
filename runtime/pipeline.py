@@ -24,6 +24,22 @@ from subtitle_utils import (
 ROOT = Path('/content/japanese-subtitles')
 STAGES = ['dual-asr', 'arbitrate-ja', 'align', 'translate-zh']
 
+
+def _detect_gpu_parallel_config():
+    """Dynamically scale concurrency and thread count based on available GPU VRAM (A100/H100 vs L4)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            if vram_gb >= 35.0:  # A100 (40GB/80GB) or H100 (80GB)
+                return 10
+    except Exception:
+        pass
+    return 6
+
+
+DEFAULT_PARALLEL = _detect_gpu_parallel_config()
+
 DEFAULT_METADATA = {
     'work_title': '',
     'track_title': '',
@@ -637,7 +653,7 @@ def _arbitrate_one_track(stem, out_dir, meta, track_guide, port):
         return b_idx, arr
 
     golden_map = {}
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=DEFAULT_PARALLEL) as ex:
         for _, arr in ex.map(run_arb_batch, batches):
             for obj in arr:
                 cleaned_ja = normalize_ja_names(obj['ja_golden'].strip(), shared_terms, fixes=shared_fixes)
@@ -654,13 +670,13 @@ def run_arbitrate_batch(jobs, port=8090):
     if not jobs:
         return
     paths = json.loads((ROOT / 'models.json').read_text(encoding='utf-8'))
-    srv = start_llama_server(paths['qwen3-14b'], Path(jobs[0]['out_dir']), port, n_parallel=6, ctx_size=40960, log_name='qwen3-14b.log')
+    srv = start_llama_server(paths['qwen3-14b'], Path(jobs[0]['out_dir']), port, n_parallel=DEFAULT_PARALLEL, ctx_size=40960, log_name='qwen3-14b.log')
     try:
         # Phase 1: Extract Track Guide for every track in the batch concurrently
         def _run_p1(job):
             return job['stem'], _extract_track_guide(job['stem'], Path(job['out_dir']), job['meta'], port)
 
-        with ThreadPoolExecutor(max_workers=min(6, len(jobs))) as ex:
+        with ThreadPoolExecutor(max_workers=min(DEFAULT_PARALLEL, len(jobs))) as ex:
             track_guides = dict(ex.map(_run_p1, jobs))
 
         # Broadcast album-wide character names, self-references, and glossary across all tracks
@@ -993,7 +1009,7 @@ def _anchor_cues_one_track(stem, out_dir, meta, port):
         return [{'id': b_idx + 1, 'zh_anchor': sub[0]['ja']}]
 
     t0 = time.monotonic()
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=DEFAULT_PARALLEL) as ex:
         for _, arr in ex.map(lambda it: (it[0], _anchor_sub_batch(it[0], it[1])), batches):
             for obj in arr:
                 cues_in[obj['id'] - 1]['zh_anchor'] = obj['zh_anchor'].strip()
@@ -1121,7 +1137,7 @@ def _translate_one_track(stem, out_dir, meta, port):
         return b_idx, _translate_sub_batch(b_idx, sub)
 
     t0 = time.monotonic()
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=DEFAULT_PARALLEL) as ex:
         res = sorted(ex.map(proc_batch, batches), key=lambda x: x[0])
     elapsed = round(time.monotonic() - t0, 2)
 
@@ -1138,7 +1154,7 @@ def run_translate_batch(jobs, port=8095):
         return
     paths = json.loads((ROOT / 'models.json').read_text(encoding='utf-8'))
     # Step 4a: Generate 1-to-1 cue-level semantic Chinese anchors (zh_anchor) with Qwen3-14B
-    srv_14b = start_llama_server(paths['qwen3-14b'], Path(jobs[0]['out_dir']), port, n_parallel=6, ctx_size=40960, log_name='qwen3-14b-anchor.log')
+    srv_14b = start_llama_server(paths['qwen3-14b'], Path(jobs[0]['out_dir']), port, n_parallel=DEFAULT_PARALLEL, ctx_size=40960, log_name='qwen3-14b-anchor.log')
     try:
         for job in jobs:
             _anchor_cues_one_track(job['stem'], Path(job['out_dir']), job['meta'], port)
@@ -1146,7 +1162,7 @@ def run_translate_batch(jobs, port=8095):
         stop_server(srv_14b)
 
     # Step 4b: Polish cue-level translations with ASMR-Qwen3.5-9B-Echo anchored by zh_anchor
-    srv_9b = start_llama_server(paths['asmr-qwen35-9b-echo'], Path(jobs[0]['out_dir']), port, n_parallel=6, ctx_size=32768, log_name='asmr-9b.log')
+    srv_9b = start_llama_server(paths['asmr-qwen35-9b-echo'], Path(jobs[0]['out_dir']), port, n_parallel=DEFAULT_PARALLEL, ctx_size=32768, log_name='asmr-9b.log')
     try:
         for job in jobs:
             out_dir = Path(job['out_dir'])
