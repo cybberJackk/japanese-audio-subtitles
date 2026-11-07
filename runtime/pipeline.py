@@ -32,7 +32,7 @@ def _detect_gpu_parallel_config():
         if torch.cuda.is_available():
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
             if vram_gb >= 35.0:  # A100 (40GB/80GB) or H100 (80GB)
-                return 10
+                return 16
     except Exception:
         pass
     return 6
