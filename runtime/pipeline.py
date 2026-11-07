@@ -35,28 +35,74 @@ ROOT = Path('/content/japanese-subtitles')
 STAGES = ['dual-asr', 'arbitrate-ja', 'align', 'translate-zh']
 
 
-def _detect_gpu_parallel_config(safety_reserve_mib=2560, slot_ctx=DEFAULT_SLOT_CTX):
-    """Dynamically compute per-model concurrency and context size from exact measured VRAM and L2-cache sweet spots."""
+def _detect_gpu_parallel_config(safety_reserve_mib=2460, slot_ctx=DEFAULT_SLOT_CTX):
+    """Dynamically compute optimal per-stage concurrency, batch size, and multi-instance layout from measured VRAM."""
     try:
         import torch
         if torch.cuda.is_available():
             total_mib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
             usable_mib = max(8192.0, total_mib - safety_reserve_mib)
-            # Measured on A100/L4:
-            # - Qwen3-14B-Q4_K_M: 9185 MiB base + 152 MiB per 1024 ctx tokens (684 MiB per 4608-token slot). Cap at 28 slots.
-            # - ASMR-Qwen3.5-9B-Echo-Q6_K (Hybrid Gated DeltaNet): 7700 MiB base + 32.5 MiB per 1024 ctx tokens.
-            #   Capped at 20 slots so recurrent DeltaNet states remain resident in GPU L2 cache (~240 tok/s peak throughput).
-            slot_kv_14b = 152.0 * (slot_ctx / 1024.0)
-            slot_kv_9b = 32.5 * (slot_ctx / 1024.0)
-            slots_14b = max(6, min(28, int((usable_mib - 9185.0) // slot_kv_14b)))
-            slots_9b = max(8, min(20, int((usable_mib - 7700.0) // slot_kv_9b)))
-            return slots_14b, slots_9b, slots_14b * slot_ctx, slots_9b * slot_ctx
+            # Empirical A100/L4 profiling (slot_ctx=4608, -b 4096 -ub 1024):
+            # - Qwen3-14B-Q4_K_M: 8972 MiB base + 720.2 MiB per 4608-token slot (156.3 MiB / 1024 tok).
+            #   On A100 (40960 MiB): 41 slots -> 38499 MiB used, 2461 MiB (2.40 GiB) free, ~363.5 gen tok/s peak.
+            #   On L4   (23034 MiB): 16 slots -> 20494 MiB used, 2540 MiB (2.48 GiB) free, ~303.9 gen tok/s.
+            slot_kv_14b = 156.3 * (slot_ctx / 1024.0)
+            slots_14b = max(6, min(41, int((usable_mib - 8972.0) // slot_kv_14b)))
+
+            # - ASMR-Qwen3.5-9B-Echo-Q6_K (Hybrid Gated DeltaNet):
+            #   Single instance caps at ~62.6% GPU compute util (~21.9 GiB VRAM).
+            #   On A100 (>=36 GiB): 2 instances x 24 slots (48 total slots) reaches 92.7% GPU util, ~36.2 GiB VRAM (~2.8 GiB free), 431.9 gen tok/s.
+            #   On L4   (<36 GiB):  1 instance  x 24 slots reaches ~20.2 GiB VRAM (~2.8 GiB free).
+            if total_mib >= 36000:
+                n_inst_9b = 2
+                slots_9b_per_inst = 24
+                asr_bs = 192
+                asr_parallel = True
+                align_inst = 2
+            elif total_mib >= 20000:
+                n_inst_9b = 1
+                slots_9b_per_inst = 24
+                asr_bs = 96
+                asr_parallel = True
+                align_inst = 2
+            else:
+                slot_kv_9b = 32.5 * (slot_ctx / 1024.0)
+                n_inst_9b = 1
+                slots_9b_per_inst = max(8, min(20, int((usable_mib - 7700.0) // slot_kv_9b)))
+                asr_bs = 32
+                asr_parallel = False
+                align_inst = 1
+
+            total_slots_9b = n_inst_9b * slots_9b_per_inst
+            return (
+                slots_14b,
+                total_slots_9b,
+                slots_9b_per_inst,
+                n_inst_9b,
+                slots_14b * slot_ctx,
+                slots_9b_per_inst * slot_ctx,
+                asr_bs,
+                asr_parallel,
+                32,
+                align_inst,
+            )
     except Exception:
         pass
-    return 6, 8, 27648, 36864
+    return 6, 8, 8, 1, 27648, 36864, 32, False, 32, 1
 
 
-DEFAULT_PARALLEL, DEFAULT_PARALLEL_9B, DEFAULT_CTX_14B, DEFAULT_CTX_9B = _detect_gpu_parallel_config(slot_ctx=DEFAULT_SLOT_CTX)
+(
+    DEFAULT_PARALLEL,
+    DEFAULT_PARALLEL_9B,
+    DEFAULT_SLOTS_PER_INST_9B,
+    DEFAULT_INSTANCES_9B,
+    DEFAULT_CTX_14B,
+    DEFAULT_CTX_9B,
+    ASR_BATCH_SIZE,
+    ASR_PARALLEL_STREAMS,
+    ALIGN_BATCH_SIZE,
+    ALIGN_INSTANCES,
+) = _detect_gpu_parallel_config(slot_ctx=DEFAULT_SLOT_CTX)
 SEM_14B = threading.Semaphore(DEFAULT_PARALLEL)
 SEM_9B = threading.Semaphore(DEFAULT_PARALLEL_9B)
 
@@ -173,9 +219,12 @@ def segment_audio_by_pauses(audio, sr, min_sec=5.0, max_sec=14.0):
     return segments
 
 
-def run_dual_asr_batch(jobs, batch_size=16):
+def run_dual_asr_batch(jobs, batch_size=None):
     import numpy as np, torch, soundfile as sf
     from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+
+    if batch_size is None:
+        batch_size = ASR_BATCH_SIZE
 
     paths = json.loads((ROOT / 'models.json').read_text(encoding='utf-8'))
     prepared = []
@@ -197,91 +246,129 @@ def run_dual_asr_batch(jobs, batch_size=16):
             anime_texts=[], turbo_texts=[], t_anime=0.0, t_turbo=0.0,
         ))
 
-    # Stream A: litagin/anime-whisper
-    mp_a = paths['litagin/anime-whisper']
-    proc_a = AutoProcessor.from_pretrained(mp_a)
-    mod_a = AutoModelForSpeechSeq2Seq.from_pretrained(
-        mp_a, torch_dtype=torch.float16, attn_implementation='sdpa'
-    ).to('cuda').eval()
-    try:
-        for item in prepared:
-            t0 = time.monotonic()
-            clips, sr = item['clips'], item['sr']
-            for b_start in range(0, len(clips), batch_size):
-                b_clips = clips[b_start:b_start + batch_size]
-                enc = proc_a(b_clips, sampling_rate=sr, return_tensors='pt', padding='max_length', return_attention_mask=True)
-                with torch.inference_mode():
+    def _run_stream_a(mod_a, proc_a, cuda_stream=None):
+        ctx = torch.cuda.stream(cuda_stream) if cuda_stream is not None else torch.inference_mode()
+        with ctx, torch.inference_mode():
+            for item in prepared:
+                t0 = time.monotonic()
+                clips, sr = item['clips'], item['sr']
+                for b_start in range(0, len(clips), batch_size):
+                    b_clips = clips[b_start:b_start + batch_size]
+                    enc = proc_a(b_clips, sampling_rate=sr, return_tensors='pt', padding='max_length', return_attention_mask=True)
                     ids = mod_a.generate(
-                        enc.input_features.to('cuda', dtype=torch.float16),
-                        attention_mask=enc.attention_mask.to('cuda'),
+                        enc.input_features.to('cuda', dtype=torch.float16, non_blocking=True),
+                        attention_mask=enc.attention_mask.to('cuda', non_blocking=True),
                         language='ja', task='transcribe',
                         max_new_tokens=256, do_sample=False,
                         no_repeat_ngram_size=5, repetition_penalty=1.05,
                     )
-                item['anime_texts'].extend(t.strip() for t in proc_a.batch_decode(ids, skip_special_tokens=True))
-            torch.cuda.synchronize()
-            item['t_anime'] = round(time.monotonic() - t0, 2)
-            print(f"STREAM_A_ANIME_WHISPER_DONE [{item['job']['stem']}]: {len(item['anime_texts'])} segs in {item['t_anime']}s", flush=True)
-    finally:
-        del mod_a
-        torch.cuda.empty_cache()
+                    item['anime_texts'].extend(t.strip() for t in proc_a.batch_decode(ids, skip_special_tokens=True))
+                if cuda_stream is not None:
+                    cuda_stream.synchronize()
+                else:
+                    torch.cuda.synchronize()
+                item['t_anime'] = round(time.monotonic() - t0, 2)
+                print(f"STREAM_A_ANIME_WHISPER_DONE [{item['job']['stem']}]: {len(item['anime_texts'])} segs in {item['t_anime']}s", flush=True)
 
-    # Stream B: openai/whisper-large-v3-turbo (with acoustic prompt)
-    mp_b = paths['openai/whisper-large-v3-turbo']
-    proc_b = AutoProcessor.from_pretrained(mp_b)
-    mod_b = AutoModelForSpeechSeq2Seq.from_pretrained(
-        mp_b, torch_dtype=torch.float16, attn_implementation='sdpa'
-    ).to('cuda').eval()
-    try:
-        for item in prepared:
-            t0 = time.monotonic()
-            meta = item['job']['meta']
-            clips, sr = item['clips'], item['sr']
-            whisper_prompt = meta.get('whisper_prompt_ja') or DEFAULT_METADATA['whisper_prompt_ja']
-            prompt_ids = proc_b.get_prompt_ids(whisper_prompt, return_tensors='pt').to('cuda')
-            if prompt_ids.ndim == 2:
-                prompt_ids = prompt_ids.squeeze(0)
-            if prompt_ids.shape[-1] > 150:
-                prompt_ids = torch.cat([prompt_ids[:1], prompt_ids[-149:]])
-            safe_max_new = min(224, 440 - int(prompt_ids.shape[-1]))
+    def _run_stream_b(mod_b, proc_b, cuda_stream=None):
+        ctx = torch.cuda.stream(cuda_stream) if cuda_stream is not None else torch.inference_mode()
+        with ctx, torch.inference_mode():
+            for item in prepared:
+                t0 = time.monotonic()
+                meta = item['job']['meta']
+                clips, sr = item['clips'], item['sr']
+                whisper_prompt = meta.get('whisper_prompt_ja') or DEFAULT_METADATA['whisper_prompt_ja']
+                prompt_ids = proc_b.get_prompt_ids(whisper_prompt, return_tensors='pt').to('cuda', non_blocking=True)
+                if prompt_ids.ndim == 2:
+                    prompt_ids = prompt_ids.squeeze(0)
+                if prompt_ids.shape[-1] > 150:
+                    prompt_ids = torch.cat([prompt_ids[:1], prompt_ids[-149:]])
+                safe_max_new = min(224, 440 - int(prompt_ids.shape[-1]))
 
-            for clip in clips:
-                enc = proc_b(clip, sampling_rate=sr, return_tensors='pt', return_attention_mask=True)
-                with torch.inference_mode():
+                for b_start in range(0, len(clips), batch_size):
+                    b_clips = clips[b_start:b_start + batch_size]
+                    enc = proc_b(b_clips, sampling_rate=sr, return_tensors='pt', padding='max_length', return_attention_mask=True)
                     ids = mod_b.generate(
-                        enc.input_features.to('cuda', dtype=torch.float16),
-                        attention_mask=enc.attention_mask.to('cuda'),
+                        enc.input_features.to('cuda', dtype=torch.float16, non_blocking=True),
+                        attention_mask=enc.attention_mask.to('cuda', non_blocking=True),
                         language='ja', task='transcribe',
                         max_new_tokens=safe_max_new, do_sample=False,
                         no_repeat_ngram_size=5, repetition_penalty=1.08,
                         prompt_ids=prompt_ids,
                     )
-                t = proc_b.batch_decode(ids, skip_special_tokens=True)[0].strip()
-                if whisper_prompt[:10] in t:
-                    t = t.replace(whisper_prompt, '').strip()
-                item['turbo_texts'].append(t)
-            torch.cuda.synchronize()
-            item['t_turbo'] = round(time.monotonic() - t0, 2)
-            print(f"STREAM_B_WHISPER_TURBO_DONE [{item['job']['stem']}]: {len(item['turbo_texts'])} segs in {item['t_turbo']}s", flush=True)
+                    for raw_t in proc_b.batch_decode(ids, skip_special_tokens=True):
+                        t = raw_t.strip()
+                        if whisper_prompt[:10] in t:
+                            t = t.replace(whisper_prompt, '').strip()
+                        item['turbo_texts'].append(t)
+                if cuda_stream is not None:
+                    cuda_stream.synchronize()
+                else:
+                    torch.cuda.synchronize()
+                item['t_turbo'] = round(time.monotonic() - t0, 2)
+                print(f"STREAM_B_WHISPER_TURBO_DONE [{item['job']['stem']}]: {len(item['turbo_texts'])} segs in {item['t_turbo']}s", flush=True)
 
-            out_dir = Path(item['job']['out_dir'])
-            paired = []
-            for idx, ((s, e), ta, tb) in enumerate(zip(item['valid_segs'], item['anime_texts'], item['turbo_texts'])):
-                if not ta and not tb:
-                    continue
-                paired.append(dict(
-                    seg_id=idx + 1,
-                    start=round(s / sr, 3),
-                    end=round(e / sr, 3),
-                    ja_anime=ta,
-                    ja_turbo=tb,
-                ))
-            atomic_write_json(out_dir / 'dual_asr_chunks.json', paired)
-            if item['job'].get('batch_mode'):
-                print(f"BATCH_TRACK_STAGE_DONE {item['job']['index']} dual-asr {item['job']['stem']}", flush=True)
-    finally:
-        del mod_b
-        torch.cuda.empty_cache()
+    mp_a = paths['litagin/anime-whisper']
+    mp_b = paths['openai/whisper-large-v3-turbo']
+
+    if ASR_PARALLEL_STREAMS:
+        proc_a = AutoProcessor.from_pretrained(mp_a)
+        mod_a = AutoModelForSpeechSeq2Seq.from_pretrained(
+            mp_a, torch_dtype=torch.float16, attn_implementation='sdpa'
+        ).to('cuda').eval()
+        proc_b = AutoProcessor.from_pretrained(mp_b)
+        mod_b = AutoModelForSpeechSeq2Seq.from_pretrained(
+            mp_b, torch_dtype=torch.float16, attn_implementation='sdpa'
+        ).to('cuda').eval()
+        try:
+            stream_a = torch.cuda.Stream()
+            stream_b = torch.cuda.Stream()
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fa = ex.submit(_run_stream_a, mod_a, proc_a, stream_a)
+                fb = ex.submit(_run_stream_b, mod_b, proc_b, stream_b)
+                fa.result()
+                fb.result()
+        finally:
+            del mod_a, mod_b
+            torch.cuda.empty_cache()
+    else:
+        proc_a = AutoProcessor.from_pretrained(mp_a)
+        mod_a = AutoModelForSpeechSeq2Seq.from_pretrained(
+            mp_a, torch_dtype=torch.float16, attn_implementation='sdpa'
+        ).to('cuda').eval()
+        try:
+            _run_stream_a(mod_a, proc_a)
+        finally:
+            del mod_a
+            torch.cuda.empty_cache()
+
+        proc_b = AutoProcessor.from_pretrained(mp_b)
+        mod_b = AutoModelForSpeechSeq2Seq.from_pretrained(
+            mp_b, torch_dtype=torch.float16, attn_implementation='sdpa'
+        ).to('cuda').eval()
+        try:
+            _run_stream_b(mod_b, proc_b)
+        finally:
+            del mod_b
+            torch.cuda.empty_cache()
+
+    for item in prepared:
+        sr = item['sr']
+        out_dir = Path(item['job']['out_dir'])
+        paired = []
+        for idx, ((s, e), ta, tb) in enumerate(zip(item['valid_segs'], item['anime_texts'], item['turbo_texts'])):
+            if not ta and not tb:
+                continue
+            paired.append(dict(
+                seg_id=idx + 1,
+                start=round(s / sr, 3),
+                end=round(e / sr, 3),
+                ja_anime=ta,
+                ja_turbo=tb,
+            ))
+        atomic_write_json(out_dir / 'dual_asr_chunks.json', paired)
+        if item['job'].get('batch_mode'):
+            print(f"BATCH_TRACK_STAGE_DONE {item['job']['index']} dual-asr {item['job']['stem']}", flush=True)
 
 
 def start_llama_server(model_path, out_dir, port, n_parallel=4, ctx_size=40960, log_name='llama.log'):
@@ -743,35 +830,71 @@ def run_arbitrate_batch(jobs, port=8090):
             if job.get('batch_mode'):
                 print(f"BATCH_TRACK_STAGE_DONE {job['index']} arbitrate-ja {job['stem']}", flush=True)
 
-        track_workers = max(2, min(len(jobs), DEFAULT_PARALLEL // 6))
+        track_workers = max(2, min(len(jobs), DEFAULT_PARALLEL // 4))
         with ThreadPoolExecutor(max_workers=track_workers) as ex:
             list(ex.map(_run_p2, jobs))
     finally:
         stop_server(srv)
 
 
-def align_chunks_to_cues(model, audio, sr, chunks, text_field, pan_10hz=None):
+def align_chunks_to_cues(model, audio, sr, chunks, text_field, pan_10hz=None, batch_size=None):
+    if batch_size is None:
+        batch_size = ALIGN_BATCH_SIZE
     norm = lambda s: re.sub(r'[\s、。！？,.!?…～〜ー・♡💛♪「」『』（）()％%]', '', s)
     rows = []
+
+    valid_items = []
     for chunk in chunks:
         ja_text = chunk[text_field].strip()
         if not ja_text or is_nonverbal_only(ja_text):
             continue
-
         data = audio[round(chunk['start'] * sr):round(chunk['end'] * sr)]
-        try:
-            units = model.align(audio=(data, sr), text=ja_text, language='Japanese')[0]
-            proj = project_punctuation(ja_text, units)
-            words = []
-            for w in proj:
-                ws = round(max(chunk['start'], min(chunk['end'], w['start'] + chunk['start'])), 3)
-                we = round(max(ws + 0.02, min(chunk['end'], w['end'] + chunk['start'])), 3)
-                words.append(dict(
-                    text=w['text'], start=ws, end=we,
-                    pan=compute_span_pan(pan_10hz, ws, we),
-                ))
-        except Exception as exc:
-            print(f'ALIGN_FALLBACK seg={chunk.get("seg_id")} error={type(exc).__name__}: {exc}', flush=True)
+        valid_items.append((chunk, ja_text, data))
+
+    aligned_units_list = [None] * len(valid_items)
+    for b_start in range(0, len(valid_items), batch_size):
+        batch = valid_items[b_start:b_start + batch_size]
+        batch_ok = False
+        if len(batch) > 1:
+            try:
+                b_audios = [(d, sr) for _, _, d in batch]
+                b_texts = [t for _, t, _ in batch]
+                b_langs = ['Japanese'] * len(batch)
+                b_res = model.align(audio=b_audios, text=b_texts, language=b_langs)
+                if (
+                    isinstance(b_res, list)
+                    and len(b_res) == len(batch)
+                    and all(not u or isinstance(getattr(u[0], 'text', None), str) for u in b_res)
+                ):
+                    for k, u in enumerate(b_res):
+                        aligned_units_list[b_start + k] = u
+                    batch_ok = True
+            except Exception:
+                batch_ok = False
+        if not batch_ok:
+            for k, (chunk, ja_text, data) in enumerate(batch):
+                try:
+                    aligned_units_list[b_start + k] = model.align(audio=(data, sr), text=ja_text, language='Japanese')[0]
+                except Exception as exc:
+                    print(f'ALIGN_FALLBACK seg={chunk.get("seg_id")} error={type(exc).__name__}: {exc}', flush=True)
+                    aligned_units_list[b_start + k] = None
+
+    for (chunk, ja_text, _), units in zip(valid_items, aligned_units_list):
+        if units is not None:
+            try:
+                proj = project_punctuation(ja_text, units)
+                words = []
+                for w in proj:
+                    ws = round(max(chunk['start'], min(chunk['end'], w['start'] + chunk['start'])), 3)
+                    we = round(max(ws + 0.02, min(chunk['end'], w['end'] + chunk['start'])), 3)
+                    words.append(dict(
+                        text=w['text'], start=ws, end=we,
+                        pan=compute_span_pan(pan_10hz, ws, we),
+                    ))
+            except Exception as exc:
+                print(f'ALIGN_FALLBACK seg={chunk.get("seg_id")} error={type(exc).__name__}: {exc}', flush=True)
+                words = []
+        else:
             words = []
 
         if not words:
@@ -883,29 +1006,45 @@ def run_align_batch(jobs):
     from qwen_asr import Qwen3ForcedAligner
 
     paths = json.loads((ROOT / 'models.json').read_text(encoding='utf-8'))
-    model = Qwen3ForcedAligner.from_pretrained(
-        paths['Qwen/Qwen3-ForcedAligner-0.6B'], dtype=torch.bfloat16, device_map='cuda:0'
-    )
+    n_inst = max(1, min(ALIGN_INSTANCES, len(jobs)))
+    models = [
+        Qwen3ForcedAligner.from_pretrained(
+            paths['Qwen/Qwen3-ForcedAligner-0.6B'], dtype=torch.bfloat16, device_map='cuda:0'
+        )
+        for _ in range(n_inst)
+    ]
+    model_locks = [threading.Lock() for _ in range(n_inst)]
+
+    def _align_one_job(item):
+        idx_j, job = item
+        slot = idx_j % n_inst
+        out_dir = Path(job['out_dir'])
+        stem = job['stem']
+        chunks = json.loads((out_dir / 'dual_asr_arbitrated.json').read_text(encoding='utf-8'))
+        audio, sr = sf.read(str(job['audio']), dtype='float32')
+        pan_10hz = job['meta'].get('stereo_pan_10hz') or []
+        t0 = time.monotonic()
+        with model_locks[slot]:
+            cues = align_chunks_to_cues(models[slot], audio, sr, chunks, 'ja_golden', pan_10hz=pan_10hz)
+        if not cues and chunks:
+            cues = [dict(start=chunks[0]['start'], end=chunks[-1]['end'], ja=chunks[0]['ja_golden'] or '…')]
+        elapsed = round(time.monotonic() - t0, 2)
+        atomic_write_json(out_dir / 'aligned_cues.json', cues)
+        write_vtt(out_dir / f'{stem}.ja.vtt', cues, 'ja')
+        atomic_write_text(out_dir / f'{stem}.ja.txt', '\n'.join(r['ja'] for r in cues) + '\n')
+        print(f'ALIGN_DONE [{stem}]: {len(cues)} cues in {elapsed}s', flush=True)
+        if job.get('batch_mode'):
+            print(f"BATCH_TRACK_STAGE_DONE {job['index']} align {stem}", flush=True)
+
     try:
-        for job in jobs:
-            out_dir = Path(job['out_dir'])
-            stem = job['stem']
-            chunks = json.loads((out_dir / 'dual_asr_arbitrated.json').read_text(encoding='utf-8'))
-            audio, sr = sf.read(str(job['audio']), dtype='float32')
-            pan_10hz = job['meta'].get('stereo_pan_10hz') or []
-            t0 = time.monotonic()
-            cues = align_chunks_to_cues(model, audio, sr, chunks, 'ja_golden', pan_10hz=pan_10hz)
-            if not cues and chunks:
-                cues = [dict(start=chunks[0]['start'], end=chunks[-1]['end'], ja=chunks[0]['ja_golden'] or '…')]
-            elapsed = round(time.monotonic() - t0, 2)
-            atomic_write_json(out_dir / 'aligned_cues.json', cues)
-            write_vtt(out_dir / f'{stem}.ja.vtt', cues, 'ja')
-            atomic_write_text(out_dir / f'{stem}.ja.txt', '\n'.join(r['ja'] for r in cues) + '\n')
-            print(f'ALIGN_DONE [{stem}]: {len(cues)} cues in {elapsed}s', flush=True)
-            if job.get('batch_mode'):
-                print(f"BATCH_TRACK_STAGE_DONE {job['index']} align {stem}", flush=True)
+        if n_inst > 1:
+            with ThreadPoolExecutor(max_workers=n_inst) as ex:
+                list(ex.map(_align_one_job, enumerate(jobs)))
+        else:
+            for item in enumerate(jobs):
+                _align_one_job(item)
     finally:
-        del model
+        del models
         torch.cuda.empty_cache()
 
 
@@ -1079,6 +1218,7 @@ def _anchor_cues_one_track(stem, out_dir, meta, port):
 def _translate_one_track(stem, out_dir, meta, port):
     import requests
     out_dir = Path(out_dir)
+    port_list = list(port) if isinstance(port, (list, tuple)) else [port]
     track_guide = json.loads((out_dir / 'track_guide.json').read_text(encoding='utf-8'))
     merged_gloss = build_merged_glossary(meta, track_guide, max_items=30)
 
@@ -1158,8 +1298,9 @@ def _translate_one_track(stem, out_dir, meta, port):
             + '\n/no_think'
         )
         last_err = None
-        for temp_try in (0.15, 0.3, 0.45):
+        for idx_try, temp_try in enumerate((0.15, 0.3, 0.45)):
             try:
+                target_port = port_list[((b_idx // batch_sz) + idx_try) % len(port_list)]
                 payload = {
                     'messages': [{'role': 'user', 'content': prompt}],
                     'temperature': temp_try,
@@ -1171,7 +1312,7 @@ def _translate_one_track(stem, out_dir, meta, port):
                 }
                 with SEM_9B:
                     req_t0 = time.monotonic()
-                    resp = requests.post(f'http://127.0.0.1:{port}/v1/chat/completions', json=payload, timeout=600)
+                    resp = requests.post(f'http://127.0.0.1:{target_port}/v1/chat/completions', json=payload, timeout=600)
                     req_sec = time.monotonic() - req_t0
                 resp.raise_for_status()
                 u_tr = resp.json().get('usage') or {}
@@ -1223,26 +1364,36 @@ def run_translate_batch(jobs, port=8095):
         def _run_4a(job):
             _anchor_cues_one_track(job['stem'], Path(job['out_dir']), job['meta'], port)
 
-        track_workers_14b = max(2, min(len(jobs), DEFAULT_PARALLEL // 6))
+        track_workers_14b = max(2, min(len(jobs), DEFAULT_PARALLEL // 4))
         with ThreadPoolExecutor(max_workers=track_workers_14b) as ex:
             list(ex.map(_run_4a, jobs))
     finally:
         stop_server(srv_14b)
 
     # Step 4b: Polish cue-level translations with ASMR-Qwen3.5-9B-Echo anchored by zh_anchor
-    srv_9b = start_llama_server(paths['asmr-qwen35-9b-echo'], Path(jobs[0]['out_dir']), port, n_parallel=DEFAULT_PARALLEL_9B, ctx_size=DEFAULT_CTX_9B, log_name='asmr-9b.log')
+    # On A100 (>=36 GiB VRAM), launches 2 parallel llama-server instances (2 x 24 = 48 total slots) to reach >92% GPU util
+    ports_9b = [port + i for i in range(DEFAULT_INSTANCES_9B)]
+    srvs_9b = []
     try:
+        for idx_i, p_i in enumerate(ports_9b):
+            srvs_9b.append(start_llama_server(
+                paths['asmr-qwen35-9b-echo'], Path(jobs[0]['out_dir']), p_i,
+                n_parallel=DEFAULT_SLOTS_PER_INST_9B, ctx_size=DEFAULT_CTX_9B,
+                log_name=f'asmr-9b-{idx_i}.log' if len(ports_9b) > 1 else 'asmr-9b.log',
+            ))
+
         def _run_4b(job):
             out_dir = Path(job['out_dir'])
-            _translate_one_track(job['stem'], out_dir, job['meta'], port)
+            _translate_one_track(job['stem'], out_dir, job['meta'], ports_9b)
             if job.get('batch_mode'):
                 print(f"BATCH_TRACK_STAGE_DONE {job['index']} translate-zh {job['stem']}", flush=True)
 
-        track_workers_9b = max(2, min(len(jobs), DEFAULT_PARALLEL_9B // 6))
+        track_workers_9b = max(2, min(len(jobs), DEFAULT_PARALLEL_9B // 4))
         with ThreadPoolExecutor(max_workers=track_workers_9b) as ex:
             list(ex.map(_run_4b, jobs))
     finally:
-        stop_server(srv_9b)
+        for srv in srvs_9b:
+            stop_server(srv)
 
 
 def _spawn_stage_subprocess(extra_args, stage_name):

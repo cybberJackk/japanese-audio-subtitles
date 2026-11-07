@@ -68,6 +68,25 @@ class SubtitlePipelineTests(unittest.TestCase):
         )
         self.assertEqual(len(result), 2)
 
+    def test_batched_align_chunks_to_cues(self):
+        class BatchedAligner:
+            def __init__(self):
+                self.batch_calls = 0
+
+            def align(self, audio, text, language):
+                self.batch_calls += 1
+                assert isinstance(text, list)
+                return [[SimpleNamespace(text=t, start_time=0.0, end_time=0.8)] for t in text]
+
+        aligner = BatchedAligner()
+        result = pipeline.align_chunks_to_cues(
+            aligner, [0] * 40, 1,
+            [dict(start=0, end=1, ja='バッチテスト一。'), dict(start=10, end=11, ja='バッチテスト二。')],
+            'ja', batch_size=32,
+        )
+        self.assertEqual(aligner.batch_calls, 1)
+        self.assertEqual(len(result), 2)
+
     def test_mounted_store_sync_and_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
