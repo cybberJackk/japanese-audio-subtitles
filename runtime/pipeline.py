@@ -26,21 +26,21 @@ STAGES = ['dual-asr', 'arbitrate-ja', 'align', 'translate-zh']
 
 
 def _detect_gpu_parallel_config():
-    """Dynamically scale concurrency and thread count based on available GPU VRAM (A100/H100 vs L4)."""
+    """Dynamically scale concurrency and context window based on available GPU VRAM (A100/H100 vs L4)."""
     try:
         import torch
         if torch.cuda.is_available():
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
             if vram_gb >= 35.0:  # A100 (40GB/80GB) or H100 (80GB)
-                return 16
+                return 24, 32, 131072, 163840
+            if vram_gb >= 20.0:  # L4 (24GB)
+                return 12, 24, 65536, 131072
     except Exception:
         pass
-    return 6
+    return 6, 8, 40960, 40960
 
 
-DEFAULT_PARALLEL = _detect_gpu_parallel_config()
-DEFAULT_CTX_14B = 98304 if DEFAULT_PARALLEL >= 16 else 40960
-DEFAULT_CTX_9B = 98304 if DEFAULT_PARALLEL >= 16 else 32768
+DEFAULT_PARALLEL, DEFAULT_PARALLEL_9B, DEFAULT_CTX_14B, DEFAULT_CTX_9B = _detect_gpu_parallel_config()
 
 DEFAULT_METADATA = {
     'work_title': '',
@@ -688,12 +688,16 @@ def run_arbitrate_batch(jobs, port=8090):
             out_dir = Path(job['out_dir'])
             atomic_write_json(out_dir / 'track_guide.json', track_guides[job['stem']])
 
-        # Phase 2: Arbitrate each track using the shared album glossary + phonetic reasoning
-        for job in jobs:
+        # Phase 2: Arbitrate tracks concurrently so all GPU slots stay saturated across track boundaries
+        def _run_p2(job):
             out_dir = Path(job['out_dir'])
             _arbitrate_one_track(job['stem'], out_dir, job['meta'], track_guides[job['stem']], port)
             if job.get('batch_mode'):
                 print(f"BATCH_TRACK_STAGE_DONE {job['index']} arbitrate-ja {job['stem']}", flush=True)
+
+        track_workers = max(2, min(len(jobs), DEFAULT_PARALLEL // 6))
+        with ThreadPoolExecutor(max_workers=track_workers) as ex:
+            list(ex.map(_run_p2, jobs))
     finally:
         stop_server(srv)
 
@@ -1139,7 +1143,7 @@ def _translate_one_track(stem, out_dir, meta, port):
         return b_idx, _translate_sub_batch(b_idx, sub)
 
     t0 = time.monotonic()
-    with ThreadPoolExecutor(max_workers=DEFAULT_PARALLEL) as ex:
+    with ThreadPoolExecutor(max_workers=DEFAULT_PARALLEL_9B) as ex:
         res = sorted(ex.map(proc_batch, batches), key=lambda x: x[0])
     elapsed = round(time.monotonic() - t0, 2)
 
@@ -1158,19 +1162,27 @@ def run_translate_batch(jobs, port=8095):
     # Step 4a: Generate 1-to-1 cue-level semantic Chinese anchors (zh_anchor) with Qwen3-14B
     srv_14b = start_llama_server(paths['qwen3-14b'], Path(jobs[0]['out_dir']), port, n_parallel=DEFAULT_PARALLEL, ctx_size=DEFAULT_CTX_14B, log_name='qwen3-14b-anchor.log')
     try:
-        for job in jobs:
+        def _run_4a(job):
             _anchor_cues_one_track(job['stem'], Path(job['out_dir']), job['meta'], port)
+
+        track_workers_14b = max(2, min(len(jobs), DEFAULT_PARALLEL // 6))
+        with ThreadPoolExecutor(max_workers=track_workers_14b) as ex:
+            list(ex.map(_run_4a, jobs))
     finally:
         stop_server(srv_14b)
 
     # Step 4b: Polish cue-level translations with ASMR-Qwen3.5-9B-Echo anchored by zh_anchor
-    srv_9b = start_llama_server(paths['asmr-qwen35-9b-echo'], Path(jobs[0]['out_dir']), port, n_parallel=DEFAULT_PARALLEL, ctx_size=DEFAULT_CTX_9B, log_name='asmr-9b.log')
+    srv_9b = start_llama_server(paths['asmr-qwen35-9b-echo'], Path(jobs[0]['out_dir']), port, n_parallel=DEFAULT_PARALLEL_9B, ctx_size=DEFAULT_CTX_9B, log_name='asmr-9b.log')
     try:
-        for job in jobs:
+        def _run_4b(job):
             out_dir = Path(job['out_dir'])
             _translate_one_track(job['stem'], out_dir, job['meta'], port)
             if job.get('batch_mode'):
                 print(f"BATCH_TRACK_STAGE_DONE {job['index']} translate-zh {job['stem']}", flush=True)
+
+        track_workers_9b = max(2, min(len(jobs), DEFAULT_PARALLEL_9B // 6))
+        with ThreadPoolExecutor(max_workers=track_workers_9b) as ex:
+            list(ex.map(_run_4b, jobs))
     finally:
         stop_server(srv_9b)
 
