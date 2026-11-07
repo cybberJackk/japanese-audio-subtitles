@@ -9,11 +9,10 @@ Stages:
   3. align         : Qwen3-ForcedAligner-0.6B word-level timing + punctuation projection + boundary echo deduplication
   4. translate-zh  : ASMR-Qwen3.5-9B-Echo controlled polishing anchored by Qwen3-14B's zh_anchor & sliding context window
 """
-import argparse, json, os, re, subprocess, sys, time
+import argparse, atexit, json, os, re, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import atexit
 from subtitle_utils import (
     analyze_asr_pair, atomic_write_json, atomic_write_text, cap_guide_lines,
      compress_extreme_repeats, compute_span_pan, dedup_boundary_echo,
@@ -29,33 +28,37 @@ except ImportError:
 GLOBAL_PROFILER = ResourceProfiler()
 GLOBAL_PROFILER.start()
 
-DEFAULT_SLOT_CTX = 5120
+# Empirical max across 3,797 requests: 4,095 tokens (arbitrate-ja), 2,559 (anchor-14b), 3,677 (translate-zh)
+DEFAULT_SLOT_CTX = 4608
 
 ROOT = Path('/content/japanese-subtitles')
 STAGES = ['dual-asr', 'arbitrate-ja', 'align', 'translate-zh']
 
 
 def _detect_gpu_parallel_config(safety_reserve_mib=2560, slot_ctx=DEFAULT_SLOT_CTX):
-    """Dynamically compute per-model concurrency and context size from exact measured VRAM footprints, keeping 2.5GB safety reserve."""
+    """Dynamically compute per-model concurrency and context size from exact measured VRAM and L2-cache sweet spots."""
     try:
         import torch
         if torch.cuda.is_available():
             total_mib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
             usable_mib = max(8192.0, total_mib - safety_reserve_mib)
             # Measured on A100/L4:
-            # - Qwen3-14B-Q4_K_M: 9185 MiB base (weights+compute) + 152 MiB per 1024 ctx tokens (760 MiB per 5120-token slot)
-            # - ASMR-Qwen3.5-9B-Echo-Q6_K: 7700 MiB base (weights+compute) + 32.5 MiB per 1024 ctx tokens (162.5 MiB per 5120-token slot)
+            # - Qwen3-14B-Q4_K_M: 9185 MiB base + 152 MiB per 1024 ctx tokens (684 MiB per 4608-token slot). Cap at 28 slots.
+            # - ASMR-Qwen3.5-9B-Echo-Q6_K (Hybrid Gated DeltaNet): 7700 MiB base + 32.5 MiB per 1024 ctx tokens.
+            #   Capped at 20 slots so recurrent DeltaNet states remain resident in GPU L2 cache (~240 tok/s peak throughput).
             slot_kv_14b = 152.0 * (slot_ctx / 1024.0)
             slot_kv_9b = 32.5 * (slot_ctx / 1024.0)
-            slots_14b = max(6, min(36, int((usable_mib - 9185.0) // slot_kv_14b)))
-            slots_9b = max(8, min(48, int((usable_mib - 7700.0) // slot_kv_9b)))
+            slots_14b = max(6, min(28, int((usable_mib - 9185.0) // slot_kv_14b)))
+            slots_9b = max(8, min(20, int((usable_mib - 7700.0) // slot_kv_9b)))
             return slots_14b, slots_9b, slots_14b * slot_ctx, slots_9b * slot_ctx
     except Exception:
         pass
-    return 6, 8, 40960, 40960
+    return 6, 8, 27648, 36864
 
 
 DEFAULT_PARALLEL, DEFAULT_PARALLEL_9B, DEFAULT_CTX_14B, DEFAULT_CTX_9B = _detect_gpu_parallel_config(slot_ctx=DEFAULT_SLOT_CTX)
+SEM_14B = threading.Semaphore(DEFAULT_PARALLEL)
+SEM_9B = threading.Semaphore(DEFAULT_PARALLEL_9B)
 
 
 def _on_pipeline_exit():
@@ -297,7 +300,8 @@ def start_llama_server(model_path, out_dir, port, n_parallel=4, ctx_size=40960, 
     def launch(fa_args):
         cmd = [
             str(binary), '-m', str(model_path), '-ngl', '99',
-            '-c', str(ctx_size), '--parallel', str(n_parallel), *fa_args,
+            '-c', str(ctx_size), '--parallel', str(n_parallel),
+            '-b', '4096', '-ub', '1024', *fa_args,
             '--host', '127.0.0.1', '--port', str(port),
         ]
         return subprocess.Popen(
@@ -428,21 +432,22 @@ def _extract_track_guide(stem, out_dir, meta, port):
     last_err = None
     for temp_try in (0.15, 0.35, 0.55):
         try:
-            req_t0 = time.monotonic()
-            r_p1 = requests.post(
-                f'http://127.0.0.1:{port}/v1/chat/completions',
-                json={
-                    'messages': [{'role': 'user', 'content': p1_prompt}],
-                    'temperature': temp_try,
-                    'max_tokens': 4096,
-                    'frequency_penalty': 0.2,
-                    'repeat_penalty': 1.18,
-                    'chat_template_kwargs': {'enable_thinking': False},
-                    'response_format': {'type': 'json_schema', 'json_schema': {'name': 'track_guide', 'strict': True, 'schema': guide_schema}},
-                },
-                timeout=180,
-            )
-            req_sec = time.monotonic() - req_t0
+            with SEM_14B:
+                req_t0 = time.monotonic()
+                r_p1 = requests.post(
+                    f'http://127.0.0.1:{port}/v1/chat/completions',
+                    json={
+                        'messages': [{'role': 'user', 'content': p1_prompt}],
+                        'temperature': temp_try,
+                        'max_tokens': 4096,
+                        'frequency_penalty': 0.2,
+                        'repeat_penalty': 1.18,
+                        'chat_template_kwargs': {'enable_thinking': False},
+                        'response_format': {'type': 'json_schema', 'json_schema': {'name': 'track_guide', 'strict': True, 'schema': guide_schema}},
+                    },
+                    timeout=600,
+                )
+                req_sec = time.monotonic() - req_t0
             r_p1.raise_for_status()
             u_p1 = r_p1.json().get('usage') or {}
             GLOBAL_PROFILER.record_request('track-guide', u_p1.get('prompt_tokens', 0), u_p1.get('completion_tokens', 0), req_sec)
@@ -651,24 +656,25 @@ def _arbitrate_one_track(stem, out_dir, meta, track_guide, port):
         last_err = None
         for temp_try in (0.1, 0.3, 0.5):
             try:
-                req_t0 = time.monotonic()
-                resp = requests.post(
-                    f'http://127.0.0.1:{port}/v1/chat/completions',
-                    json={
-                        'messages': [
-                            {'role': 'system', 'content': arb_sys},
-                            {'role': 'user', 'content': user_msg},
-                        ],
-                        'temperature': temp_try,
-                        'max_tokens': 4096,
-                        'frequency_penalty': 0.18,
-                        'repeat_penalty': 1.15,
-                        'chat_template_kwargs': {'enable_thinking': False},
-                        'response_format': {'type': 'json_schema', 'json_schema': {'name': 'arb_ja', 'strict': True, 'schema': schema}},
-                    },
-                    timeout=180,
-                )
-                req_sec = time.monotonic() - req_t0
+                with SEM_14B:
+                    req_t0 = time.monotonic()
+                    resp = requests.post(
+                        f'http://127.0.0.1:{port}/v1/chat/completions',
+                        json={
+                            'messages': [
+                                {'role': 'system', 'content': arb_sys},
+                                {'role': 'user', 'content': user_msg},
+                            ],
+                            'temperature': temp_try,
+                            'max_tokens': 4096,
+                            'frequency_penalty': 0.18,
+                            'repeat_penalty': 1.15,
+                            'chat_template_kwargs': {'enable_thinking': False},
+                            'response_format': {'type': 'json_schema', 'json_schema': {'name': 'arb_ja', 'strict': True, 'schema': schema}},
+                        },
+                        timeout=600,
+                    )
+                    req_sec = time.monotonic() - req_t0
                 resp.raise_for_status()
                 u = resp.json().get('usage') or {}
                 GLOBAL_PROFILER.record_request('arbitrate-ja', u.get('prompt_tokens', 0), u.get('completion_tokens', 0), req_sec)
@@ -1023,24 +1029,25 @@ def _anchor_cues_one_track(stem, out_dir, meta, port):
         last_err = None
         for temp_try in (0.1, 0.25, 0.4):
             try:
-                req_t0 = time.monotonic()
-                resp = requests.post(
-                    f'http://127.0.0.1:{port}/v1/chat/completions',
-                    json={
-                        'messages': [
-                            {'role': 'system', 'content': anchor_sys},
-                            {'role': 'user', 'content': user_msg},
-                        ],
-                        'temperature': temp_try,
-                        'max_tokens': 3000,
-                        'frequency_penalty': 0.15,
-                        'repeat_penalty': 1.12,
-                        'chat_template_kwargs': {'enable_thinking': False},
-                        'response_format': {'type': 'json_schema', 'json_schema': {'name': 'zh_anc', 'strict': True, 'schema': schema}},
-                    },
-                    timeout=180,
-                )
-                req_sec = time.monotonic() - req_t0
+                with SEM_14B:
+                    req_t0 = time.monotonic()
+                    resp = requests.post(
+                        f'http://127.0.0.1:{port}/v1/chat/completions',
+                        json={
+                            'messages': [
+                                {'role': 'system', 'content': anchor_sys},
+                                {'role': 'user', 'content': user_msg},
+                            ],
+                            'temperature': temp_try,
+                            'max_tokens': 3000,
+                            'frequency_penalty': 0.15,
+                            'repeat_penalty': 1.12,
+                            'chat_template_kwargs': {'enable_thinking': False},
+                            'response_format': {'type': 'json_schema', 'json_schema': {'name': 'zh_anc', 'strict': True, 'schema': schema}},
+                        },
+                        timeout=600,
+                    )
+                    req_sec = time.monotonic() - req_t0
                 resp.raise_for_status()
                 u_anc = resp.json().get('usage') or {}
                 GLOBAL_PROFILER.record_request('anchor-14b', u_anc.get('prompt_tokens', 0), u_anc.get('completion_tokens', 0), req_sec)
@@ -1162,9 +1169,10 @@ def _translate_one_track(stem, out_dir, meta, port):
                     'repeat_penalty': 1.12,
                     'chat_template_kwargs': {'enable_thinking': False},
                 }
-                req_t0 = time.monotonic()
-                resp = requests.post(f'http://127.0.0.1:{port}/v1/chat/completions', json=payload, timeout=180)
-                req_sec = time.monotonic() - req_t0
+                with SEM_9B:
+                    req_t0 = time.monotonic()
+                    resp = requests.post(f'http://127.0.0.1:{port}/v1/chat/completions', json=payload, timeout=600)
+                    req_sec = time.monotonic() - req_t0
                 resp.raise_for_status()
                 u_tr = resp.json().get('usage') or {}
                 GLOBAL_PROFILER.record_request('translate-zh', u_tr.get('prompt_tokens', 0), u_tr.get('completion_tokens', 0), req_sec)
