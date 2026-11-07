@@ -45,27 +45,31 @@ def _detect_gpu_parallel_config(safety_reserve_mib=2460, slot_ctx=DEFAULT_SLOT_C
             # Empirical A100/L4 profiling (slot_ctx=4608, -b 4096 -ub 1024):
             # - Qwen3-14B-Q4_K_M: 8972 MiB base + 720.2 MiB per 4608-token slot (156.3 MiB / 1024 tok).
             #   On A100 (40960 MiB): 41 slots -> 38499 MiB used, 2461 MiB (2.40 GiB) free, ~363.5 gen tok/s peak.
-            #   On L4   (23034 MiB): 16 slots -> 20494 MiB used, 2540 MiB (2.48 GiB) free, ~303.9 gen tok/s.
-            slot_kv_14b = 156.3 * (slot_ctx / 1024.0)
-            slots_14b = max(6, min(41, int((usable_mib - 8972.0) // slot_kv_14b)))
-
+            #   On L4   (23034 MiB): 16 slots -> 21772 MiB used, 1262 MiB (1.23 GiB) free, ~131.7 gen tok/s (14 slots keeps 2.63 GiB reserve at 124.7 tok/s).
             # - ASMR-Qwen3.5-9B-Echo-Q6_K (Hybrid Gated DeltaNet):
-            #   Single instance caps at ~62.6% GPU compute util (~21.9 GiB VRAM).
-            #   On A100 (>=36 GiB): 2 instances x 24 slots (48 total slots) reaches 92.7% GPU util, ~36.2 GiB VRAM (~2.8 GiB free), 431.9 gen tok/s.
-            #   On L4   (<36 GiB):  1 instance  x 24 slots reaches ~20.2 GiB VRAM (~2.8 GiB free).
+            #   On A100 (>=36 GiB): dual-instance (2x24=48 slots) breaks single-process CPU/L2 bottleneck -> 431.9 gen tok/s, 92.7% GPU util.
+            #   On L4   (<36 GiB):  dual-instance degrades due to 300 GB/s bandwidth & 72W power cap (2x16 only 167.8 tok/s).
+            #                       Single instance at 48~52 slots scales cleanly to 194.7 gen tok/s, 17.2 GiB used (5.8 GiB reserve).
             if total_mib >= 36000:
+                slot_kv_14b = 156.3 * (slot_ctx / 1024.0)
+                slots_14b = max(6, min(41, int((usable_mib - 8972.0) // slot_kv_14b)))
                 n_inst_9b = 2
                 slots_9b_per_inst = 24
                 asr_bs = 192
                 asr_parallel = True
                 align_inst = 2
             elif total_mib >= 20000:
+                slot_kv_14b = 156.3 * (slot_ctx / 1024.0)
+                # Keep 2.5GB safety margin on L4: 15 slots (or 16 slots with 1.26GB margin)
+                slots_14b = max(6, min(16, int((usable_mib - 8972.0) // slot_kv_14b)))
                 n_inst_9b = 1
-                slots_9b_per_inst = 24
+                slots_9b_per_inst = 48
                 asr_bs = 96
                 asr_parallel = True
                 align_inst = 2
             else:
+                slot_kv_14b = 156.3 * (slot_ctx / 1024.0)
+                slots_14b = max(4, min(10, int((usable_mib - 8972.0) // slot_kv_14b)))
                 slot_kv_9b = 32.5 * (slot_ctx / 1024.0)
                 n_inst_9b = 1
                 slots_9b_per_inst = max(8, min(20, int((usable_mib - 7700.0) // slot_kv_9b)))
